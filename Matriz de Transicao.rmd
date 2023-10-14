@@ -1,0 +1,467 @@
+---
+title: "Matriz de Transição"
+author: "Alexandre Barros"
+date: '2022-06-02'
+output:
+  pdf_document: default
+Abstract: Este documento foi elaborado com o objetivo de esclarecer a metodologia, transporta para o R, de estimativa da matriz de transição para o mercado de trabalho com dados da PNADC; para tanto, comentará os códigos, variáveis, pacotes e funções utilizados.
+---
+
+## PRELIMINARES
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = F)
+
+#-- Dependências
+library(tidyverse) # pacote genérico para tratamento de dados
+library(srvyr) # pacote estatístico para estimativas de dados em painel
+library(survey) # pacote estatístico para tratar de dados em painel
+library(gdata) # funções de gerenciamento dos dados
+library(PNADcIBGE) # ferramenta do IBGE para leitura dos dados da PNADc
+library(magrittr) # funções pipe para organizar o código
+
+# Pré-configurações
+# setwd("C:/Users/Usuario/Downloads") # ditetório
+options(survey.lonely.psu="remove") # configuração do pacote survey para ignorar estratos unos
+```
+
+## ETAPA 1: CARREGAR OS MICRODADOS POR TRIMESTRE DO ANO
+
+
+- UF = Unidade Federativa 
+- UPA = Unidade primária de amostragem (UPA), ID do domicílio
+- posest = Domínio da projeção por região (UF e tipo de localidade) 
+- posest_sxi = Domínio da projeção por idade e sexo 
+- V1008 = Identificador por número de seleção do domicílio | 
+- V1014 = Painel do grupo (cluster) amostral
+- V1028 = Peso do indivído e município já estratificado
+- V1033 = Projeção populacional por idade e sexo (IBGE) 
+- V1029 | Projeção populacional por região amostral (IBGE)
+- Estrato = Estratificador dos dados
+- V2008, V20081 e V20081 = Dia, mês e ano de nascimento
+- V2007 = Sexo
+- V2009 = Idade 
+
+- VD4001 = "Faz parte da força de trabalho?" 
+- VD4002 | "Está ocupado no mercado de trabalho?"
+- V4019 | A empresa tem CNPJ? 
+- V4046 | O negócio tem CNPJ? 
+- VD4009 = "Está ocupado com carteira assinada?"
+
+```{r}
+
+#-- Nome dos arquivos
+arquivos <- c("PNADC_012021.txt", #nome dos arquivos por trimestre do ano analisado
+              "PNADC_022021.txt", 
+              "PNADC_032021.txt", 
+              "PNADC_042021.txt",
+#-- Imput
+              "input_PNADC_trimestral.txt") 
+
+#-- Nome das variáveis - conforme a posição de cada variável no arquivo .txt
+variaveis <- c("UF", "UPA", "Estrato", "posest", "posest_sxi", "V1008", "V1014", "V1028", 
+               "V2007", "V2009", "VD4001", "VD4002", "VD4009", "V4046", "V4019", "V1029",
+               "V1033", "V2008", "V20081", "V20082")
+
+# Leitura dos microdados: o arquivo Input configura a função read_pnadc (importação off-line) 
+dados_pnad_1t <- read_pnadc(arquivos[1], input_txt = arquivos[5], vars = variaveis) 
+dados_pnad_2t <- read_pnadc(arquivos[2], input_txt = arquivos[5], vars = variaveis)
+dados_pnad_3t <- read_pnadc(arquivos[3], input_txt = arquivos[5], vars = variaveis)
+dados_pnad_4t <- read_pnadc(arquivos[4], input_txt = arquivos[5], vars = variaveis)
+
+# remoção das variáveis de peso (importadas automaticamente)
+dados_pnad_1t %<>% select("Ano":"VD4009")
+dados_pnad_2t %<>% select("Ano":"VD4009")
+dados_pnad_3t %<>% select("Ano":"VD4009")
+dados_pnad_4t %<>% select("Ano":"VD4009")
+gc()
+``` 
+
+## ETAPA 2: ADICIONAR OS IDENTIFICADORES DO EMPREGO 
+
+> Condições Ocupacionais (CO): Informal, formal, desocupato e inativo.
+
+Nesta etapa, para cada trimestre, insere-se uma variável para identificar a posição do indivíduo na unidade amostral (domicílio).
+
+```{r}
+
+for(i in 1:4){
+#-- Criando as novas variáveis derivadas 
+  
+assign(str_glue('dados_pnad_{i}t'), # ! Base original 
+
+      mutate(get(str_glue('dados_pnad_{i}t')), # Base alterada
+                  one = 1, # numerador, para projeção de toda a base
+                  V2009 = as.numeric(V2009),
+             # data de nascimento como data
+                  Data_nasci = paste(V2008, V20081, V20082, sep = "-"), 
+                  Ocupacao1t = case_when(
+                  VD4009 %in% c("01","03","05","06","07") | V4046 == 1 | V4019 == 1 ~ "Formal",
+                  VD4009 %in% c("02","04","10") | V4046 == 2 | V4019 == 2 ~ "Informal",
+                  VD4002 == 2 ~ "Desocupado", 
+                  VD4001 == 2 ~ "Fora da PEA"))
+      )
+}
+
+```
+
+## ETAPA 3: IDENTIFICAR OS MESMOS INDIVIDUOS PARA OS TRIMESTRES, GERANDO SUBAMOSTRAS
+
+> Recomenda-se a leitura do [artigo](https://rct.dieese.org.br/index.php/rct/article/view/239) publicado pela DIEESE.
+
+Aqui, usa-se de variáveis que identifiquem o domicílio (unidade amostral - UPA) e os indivíduos, de um trimestre para outro.
+A função inner_join() elimina as observações não verificadas em ambos os trimestre, gerando uma subamostra com as mesmas variáveis para o respectivo indivíduo nos respectivos trimestres.
+
+- Identificam domicílios: UPA, V1008 e V1014; 
+- Identificam indivíduos: data de nascimento e sexo;
+
+```{r}
+# SUBAMOSTRA DA PNAD
+
+#-- 1 trimestre do ano-referência para 2t do ano
+dados_transicao <- dados_pnad_1t %>% 
+  inner_join(dados_pnad_2t, 
+             by = c("UPA", "V1008", "V1014", "Data_nasci", "V2007"),
+             suffix = c(".x",".y")) # sufixo para identificar o trimestre da variável
+
+#-- 2 trimestre para 3 trimestre
+dados_transicao2 <- dados_pnad_2t %>% 
+  inner_join(dados_pnad_3t, 
+             by = c("UPA", "V1008", "V1014", "Data_nasci", "V2007"),
+             suffix = c(".x",".y"))
+
+#-- 3 trimestre para 4 trimestre
+dados_transicao3 <- dados_pnad_3t %>% 
+  inner_join(dados_pnad_4t, 
+             by = c("UPA", "V1008", "V1014", "Data_nasci", "V2007"),
+             suffix = c(".x",".y"))
+
+#-- contagem da população da subamostra gerada, para cada trimestre
+tamanhos <- data.frame(pop_inicial = dados_pnad_1t %>% group_by(posest) %>% summarise(n = n()),
+                        pop_final = dados_transicao %>% group_by(posest.x) %>% summarise(n = n())) 
+
+tamanhos2 <- data.frame(pop_inicial = dados_pnad_2t %>% group_by(posest) %>% summarise(n = n()),
+                        pop_final = dados_transicao2 %>% group_by(posest.x) %>% summarise(n = n())) 
+
+tamanhos3 <- data.frame(pop_inicial = dados_pnad_3t %>% group_by(posest) %>% summarise(n = n()),
+                        pop_final = dados_transicao3 %>% group_by(posest.x) %>% summarise(n = n())) 
+
+#-- adição da população Às respectivas bases
+dados_transicao %<>% merge(tamanhos, by.x = 'posest.x', by.y = 'pop_inicial.posest', all.x = T)
+dados_transicao2 %<>% merge(tamanhos2, by.x = 'posest.x', by.y = 'pop_inicial.posest', all.x = T)
+dados_transicao3 %<>% merge(tamanhos3, by.x = 'posest.x', by.y = 'pop_inicial.posest', all.x = T)
+
+# retirando excesso de objetos
+# gdata::keep("dados_transicao", "dados_transicao2", "dados_transicao3", "tamanhos", "tamanhos2", "tamanhos3", sure = T)
+gc()
+```
+
+## ETAPA 4: AJUSTE PRELIMINAR DOS PESOS, CRIANDO PAINEIS POR PERÍODOS CONSECUTIVOS
+
+> A partir da mesma referência.
+
+Aqui, a partir da amostragem complexa da PNADc, cria-se OS painéis usando o pacote Survey para estimações. Como se vê, a base de dados dispõe de todas as variáveis para isso.
+
+No entanto, como se trata de uma amostra derivada (com cerca de 4/5 do total original), os pesos no geral não têm validade frente as perdas nas observações. Assim, é essencial o ajuste proporcional dos pesos:
+
+> Obs.: o peso de referência será sempre o do trimestre anterior
+
+```{r}
+painel_pnadc_12 <- dados_transicao %>% 
+  mutate(peso = as.numeric(V1028.x)*(pop_inicial.n/pop_final.n)) %>% # ajuste nos pesos
+  as_survey_design(ids = UPA, # especificação dos identificadores do conjunto dos dados
+                   strata = Estrato.x, # especificação dos estratos
+                   weights = peso, # pesos por observação
+                   nest = TRUE)  # agrupamento dos estratos, caso haja diferentes id's dentro de cada estrato
+# o mesmo para os novos painéis
+
+painel_pnadc_23 <- dados_transicao2 %>% 
+  mutate(peso = as.numeric(V1028.x)*(pop_inicial.n/pop_final.n)) %>% 
+  as_survey_design(ids = UPA, 
+                   strata = Estrato.x, 
+                   weights = peso, 
+                   nest = TRUE)  
+
+painel_pnadc_34 <- dados_transicao3 %>% 
+  mutate(peso = as.numeric(V1028.x)*(pop_inicial.n/pop_final.n)) %>% 
+  as_survey_design(ids = UPA, 
+                   strata = Estrato.x, 
+                   weights = peso, 
+                   nest = TRUE)  
+gc()
+```
+
+## ETAPA 5: AJUSTE DOS PESOS com PROJEÇÃO POR SEXO E IDADE (posest_sxi) e DOMÍNIO DA ÁREA (posest)
+
+> Nesta etapa devemos ajustar os pesos a fim de consolidar a base amostral.
+
+### ETAPA 5.1: projeção de cada domínio com ajuste parcial dos pesos
+
+Seguindo-se a metodologia do DIESSE, realiza-se estimativa do total indivíduos dentro de dois tipos de estratificadores: por idade e sexo e por região. Assim, pode-se fazer a proporção e reajustar o pesos de maneira precisa pelo ajuste da estimação dentro de cada estrato da amostra.
+
+A função survey_total, do pacote srvyr, realiza essa estimativa no total.
+
+```{r}
+# 1 PARA IDADE E SEXO
+ajuste_pesos <- painel_pnadc_12 %>%
+  group_by(posest_sxi.x) %>% # fixa os grupos para estimações
+  summarise(projecao = survey_total(na.rm = TRUE, vartype = NULL)) 
+#-- ra.rm = ignora obs. vazias; 
+#-- vartype = retira a variável do erro padrão, deixando apenas a estimativa
+
+ajuste_pesos2 <- painel_pnadc_23 %>%
+  group_by(posest_sxi.x) %>%
+  summarise(projecao = survey_total(na.rm = TRUE, vartype = NULL))
+
+ajuste_pesos3 <- painel_pnadc_34 %>%
+  group_by(posest_sxi.x) %>%
+  summarise(projecao = survey_total(na.rm = TRUE, vartype = NULL))
+
+# 2 PARA REGIÃO (domínio) DA AMOSTRA
+ajuste_pesos4 <- painel_pnadc_12 %>%
+  group_by(posest.x) %>%
+  summarise(projecao2 = survey_total(na.rm = TRUE, vartype = NULL))
+
+ajuste_pesos5 <- painel_pnadc_23 %>%
+  group_by(posest.x) %>%
+  summarise(projecao2 = survey_total(na.rm = TRUE, vartype = NULL))
+
+ajuste_pesos6 <- painel_pnadc_34 %>%
+  group_by(posest.x) %>%
+  summarise(projecao2 = survey_total(na.rm = TRUE, vartype = NULL))
+
+saveRDS(ajuste_pesos4, "ajuste_peso4.RDS")
+```
+
+### ETAPA 5.2: inserir projeções à base
+
+Aqui, a fim de realizar o quociente das estimações realizadas com a estimação original, inclui-se à base os dados calculados na etapa anterior
+
+```{r}
+painel_pnadc_12 <- merge(painel_pnadc_12, ajuste_pesos, by = "posest_sxi.x") %>% 
+  inner_join(ajuste_pesos4, by = "posest.x")
+
+painel_pnadc_23 <- merge(painel_pnadc_23, ajuste_pesos2, by = "posest_sxi.x") %>% 
+  inner_join(ajuste_pesos5, by = "posest.x")
+
+painel_pnadc_34 <- merge(painel_pnadc_34, ajuste_pesos3, by = "posest_sxi.x") %>% 
+  inner_join(ajuste_pesos6, by = "posest.x")
+
+#-- retirando o excesso de objetos
+gdata::keep("painel_pnadc_12", "painel_pnadc_34", "painel_pnadc_23", sure = T)
+```
+
+### ETAPA 5.3: novo painel da PNADc, ajustando os pesos
+
+Finalmente, realiza-se o ajuste definitivo dos pesos conforme a Metodologia.
+
+```{r}
+painel_pnadc_12 %<>% 
+  mutate(denominador = (as.numeric(V1029.x)/projecao2)*(as.numeric(V1033.x)/projecao),
+         peso = peso*denominador) %>% 
+  as_survey_design(ids = UPA, 
+                   strata = Estrato.x, 
+                   weights = peso, 
+                   nest = TRUE)
+
+painel_pnadc_23 %<>% 
+  mutate(denominador = (as.numeric(V1029.x)/projecao2)*(as.numeric(V1033.x)/projecao),
+         peso = peso*denominador) %>% 
+  as_survey_design(ids = UPA, 
+                   strata = Estrato.x, 
+                   weights = peso, 
+                   nest = TRUE)
+
+painel_pnadc_34 %<>% 
+  mutate(denominador = (as.numeric(V1029.x)/projecao2)*(as.numeric(V1033.x)/projecao),
+         peso = peso*denominador) %>% 
+  as_survey_design(ids = UPA, 
+                   strata = Estrato.x, 
+                   weights = peso, 
+                   nest = TRUE)
+
+#-- Teste de estimativa - todo o Brasil
+svytotal( ~ one.y, design = painel_pnadc_34) 
+```
+
+## ETAPA 6: MATRIZ DE TRANSIÇÃO E TAXA DE TRANSIÇÃO
+
+> Nesta etapa final, pode-se finalmente aplicar a metodologia algébrica de [Barbosa Filho e Moura (2013)](https://caen.ufc.br/wp-content/uploads/2013/06/evolucao-recente-da-informalidade-no-brasil-uma-analise-segundo-caracteristicas-da-oferta-e-demanda-de-trabalho.pdf).
+
+### ETAPA 6.1 - linha: CO período inicial - colunas: CO período final
+
+Para a amostra filtrada para o Piauí:
+
+```{r piauí}
+painel_pnadc_12_pi <- painel_pnadc_12 %>%
+  filter(V2009.x >= 14 & UF.x == 22) %>%
+  group_by(Ocupacao1t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao2t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao2t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao2t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao2t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+painel_pnadc_23_pi <- painel_pnadc_23 %>%
+  filter(V2009.x >= 14 & UF.x == 22) %>%
+  group_by(Ocupacao2t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao3t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao3t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao3t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao3t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+painel_pnadc_34_pi <-painel_pnadc_34 %>%
+  filter(V2009.x >= 14 & UF.x == 22) %>%
+  group_by(Ocupacao3t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao4t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao4t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao4t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao4t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+# consolidando os trimestres pela média de transições verificadas
+matriz_final_qtd_pi <- merge(painel_pnadc_12_pi, painel_pnadc_23_pi, by.x = "Ocupacao1t", by.y = "Ocupacao2t") %>%
+  inner_join(painel_pnadc_34_pi, by = c("Ocupacao1t" = "Ocupacao3t")) %>%
+  mutate(
+    desocupadof = (desocupado + desocupado.x + desocupado.y)/3,
+    formalf = (formal + formal.x + formal.y)/3,
+    informalf = (informal + informal.x + informal.y)/3,
+    fora_da_PEAf = (foradaPEA + foradaPEA.x + foradaPEA.y)/3,
+    totalf = (total + total.x + total.y)/3
+  ) # %>% select(Ocupacao1t, desocupadof:totalf)
+
+saveRDS(matriz_final_qtd_pi, "matriz_piaui_2021.rds") # salvando a base
+gdata::keep("painel_pnadc_12", "painel_pnadc_34", "painel_pnadc_23", sure = T) # retirando o excesso de objetos
+```
+
+Para a amostra filtrada para o Nordeste:
+
+```{r Nordeste}
+painel_pnadc_12_ne <- painel_pnadc_12 %>%
+  filter(V2009.x >= 14 & UF.x %in% c(21:29)) %>%
+  group_by(Ocupacao1t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao2t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao2t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao2t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao2t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+painel_pnadc_23_ne <- painel_pnadc_23 %>%
+  filter(V2009.x >= 14 & UF.x %in% c(21:29)) %>%
+  group_by(Ocupacao2t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao3t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao3t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao3t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao3t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+painel_pnadc_34_ne <- painel_pnadc_34 %>%
+  filter(V2009.x >= 14 & UF.x %in% c(21:29)) %>%
+  group_by(Ocupacao3t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao4t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao4t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao4t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao4t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+matriz_final_qtd_ne <- merge(painel_pnadc_12_ne, painel_pnadc_23_ne, 
+                          by.x = "Ocupacao1t", by.y = "Ocupacao2t") %>%
+  inner_join(painel_pnadc_34_ne, by = c("Ocupacao1t" = "Ocupacao3t")) %>%
+  mutate(
+    desocupadof = (desocupado + desocupado.x + desocupado.y)/3,
+    formalf = (formal + formal.x + formal.y)/3,
+    informalf = (informal + informal.x + informal.y)/3,
+    fora_da_PEAf = (foradaPEA + foradaPEA.x + foradaPEA.y)/3,
+    totalf = (total + total.x + total.y)/3
+  ) # %>% select(Ocupacao1t, desocupadof:totalf)
+
+saveRDS(matriz_final_qtd_ne, "matriz_nordeste_2021.rds") 
+gdata::keep("painel_pnadc_12", "painel_pnadc_34", "painel_pnadc_23", sure = T) # retirando o excesso de objetos
+```
+
+Amostra sem filtros para todo o Brasil:
+
+```{r Brasil}
+painel_pnadc_12_br <- painel_pnadc_12 %>%
+  filter(V2009.x >= 14) %>%
+  group_by(Ocupacao1t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao2t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao2t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao2t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao2t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+painel_pnadc_23_br <- painel_pnadc_23 %>%
+  filter(V2009.x >= 14) %>%
+  group_by(Ocupacao2t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao3t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao3t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao3t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao3t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+painel_pnadc_34_br <- painel_pnadc_34 %>%
+  filter(V2009.x >= 14) %>%
+  group_by(Ocupacao3t) %>%
+  summarise(
+    desocupado = survey_total(Ocupacao4t == "Desocupado", na.rm = TRUE, vartype = NULL),
+    foradaPEA = survey_total(Ocupacao4t == "Fora da PEA", na.rm = TRUE, vartype = NULL),
+    formal = survey_total(Ocupacao4t == "Formal", na.rm = TRUE, vartype = NULL),
+    informal = survey_total(Ocupacao4t == "Informal", na.rm = TRUE, vartype = NULL)) %>%
+  mutate(total = formal + informal + desocupado + foradaPEA)
+
+matriz_final_qtd_br <- merge(painel_pnadc_12_br, painel_pnadc_23_br, 
+                      by.x = "Ocupacao1t", by.y = "Ocupacao2t") %>%
+  inner_join(painel_pnadc_34_br, by = c("Ocupacao1t" = "Ocupacao3t")) %>%
+  mutate(
+    desocupadof = (desocupado + desocupado.x + desocupado.y)/3,
+    formalf = (formal + formal.x + formal.y)/3,
+    informalf = (informal + informal.x + informal.y)/3,
+    fora_da_PEAf = (foradaPEA + foradaPEA.x + foradaPEA.y)/3,
+    totalf = (total + total.x + total.y)/3
+  ) # %>% select(Ocupacao1t, desocupadof:totalf)
+
+saveRDS(matriz_final_qtd_br, "matriz_brasil_2021.rds") # salvando a base
+gdata::keep("painel_pnadc_12", "painel_pnadc_34", "painel_pnadc_23", sure = T) # retirando o excesso de objetos
+```
+
+### ETAPA 6.2: matriz de taxa de transição 
+
+```{r}
+matri_taxa_transicao <- matriz_final_qtdb %>%
+  mutate(taxa_desocupado = desocupadof/totalf,
+         taxa_foradapea = fora_da_PEAf/totalf,
+         taxa_formal = formalf/totalf,
+         taxa_informal = informalf/totalf) 
+ # select(Ocupacao0.x, taxa_desocupado:taxa_informal)
+```
+
+
+```{r}
+# Salvando planilhas .csv
+write.table(matriz_final_qtd, "matriz_quantidade_transicao.csv", dec = ",", sep = ";", row.names = F)
+write.table(matri_taxa_transicao, "matriz_probabilidade_transicao.csv", dec = ",", sep = ";", row.names = F)
+```
+
+### COMENTÁRIOS
+
+  A utilização dos microdados amostrais sazonalizados da PNADC-T teve de se valer, para que as estimativas fossem exitosas, do pacote _srvyr_, a partir das funções _survey_, responsáveis por capturar as informações dos indentificadores (var. UPA), dos estratificadores da amostra (var. Estrato) e dos pesos atribuídos a cada observação calibrados pelo IBGE (var. peso/V1028). 
+
+  De um período para outro, dado que o painel rotativo da PNADC permite _acompanhar_ indivíduos observados, houve perda na amostra; para evitar distorções a partir de estimativas dessa subamostra (após perda por omissão, diferença de idades informadas etc.) o que levou a ter de corrigir os pesos conforme a [metodologia da DIEESE](https://rct.dieese.org.br/index.php/rct/article/view/239).
+
+  A projeção com a subamostra (5.3) mostrou-se compatível com a projeção original (mostrando erro padrão conforme esperado), indicando êxito dos ajustes feitos.
+
+  No entanto, pretende-se ainda conferir que as projeções de transição estão compatíveis com o montante dos grupos informados pelo SIDRA, para cada trimestre, relevando o erro e desvio observados.
+
+  A próxima etapa será replicar a matriz para o período final estudado (2021), e mensurar a variação da probabilidade transição.
+
+  OBS.: os códigos replicados entre períodos foram feitos por preferência ao "caminho mais longo", mas mais confiável, podendo-se observar e localizar possíveis erros e corrigi-los.

@@ -1,0 +1,16 @@
+"","Ano","get(grupos[j])","Variavel","regiao","S_informal","S_formal","Proporção"
+"1","2022","Comércio","Setor","Brasil",1079.2,2412.53,0.45
+"2","2022","Comércio","Setor","Nordeste",1079.2,2412.53,0.45
+"3","2022","Comércio","Setor","Piauí",830.88,2366.72,0.35
+"4","2022","Construção","Setor","Brasil",994,2302.87,0.43
+"5","2022","Construção","Setor","Nordeste",994,2302.87,0.43
+"6","2022","Construção","Setor","Piauí",803.3,2075.78,0.39
+"7","2022","Indústria de Transformação","Setor","Brasil",702.6,2032.05,0.35
+"8","2022","Indústria de Transformação","Setor","Nordeste",702.6,2032.05,0.35
+"9","2022","Indústria de Transformação","Setor","Piauí",489.48,2175.51,0.22
+"10","2022","Serviço Privado","Setor","Brasil",1055.74,2516.48,0.42
+"11","2022","Serviço Privado","Setor","Nordeste",1055.74,2516.48,0.42
+"12","2022","Serviço Privado","Setor","Piauí",980,2575.43,0.38
+"13","2022","Serviço Público","Setor","Brasil",1034.09,3678.5,0.28
+"14","2022","Serviço Público","Setor","Nordeste",1034.09,3678.5,0.28
+"15","2022","Serviço Público","Setor","Piauí",782.97,4376.86,0.18

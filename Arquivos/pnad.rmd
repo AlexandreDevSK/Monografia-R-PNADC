@@ -1,0 +1,28 @@
+---
+title: "Pnad Contínua"
+author: "Grupo de R Economia UFPI"
+date: "2022-11-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(PNADcIBGE)
+library(tidyverse)
+library(magrittr)
+```
+
+#- Importação
+
+```{r}
+
+variaveis <- c("UF", "UPA", "Estrato", "posest", "V2007", "V2010", "V403312", "V1028")
+
+dados_pnad_22_1t <- read_pnadc("PNADC_012022.txt", input_txt = "input_PNADC_trimestral.txt", vars = variaveis)
+dados_pnad_22_2t <- read_pnadc("PNADC_022022.txt", input_txt = "input_PNADC_trimestral.txt", vars = variaveis)
+
+dados_pnad_22_1t %<>% select(UF:V403312)
+dados_pnad_22_2t %<>% select(UF:V403312)
+```
+
